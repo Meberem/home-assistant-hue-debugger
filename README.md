@@ -12,11 +12,21 @@ example:
 It does **not** change any behaviour. It only adds logging around the existing
 Home Assistant Hue integration by wrapping (monkey-patching) these internals:
 
-- `HueBridge.async_request_call` – the HA-level command (with the mapped entity).
-- `HueBridgeV2.request` – the logical aiohue API call.
+- `HueBridge.async_request_call` – the HA-level command (with the mapped
+  entity), plus the bridge-reported state of the target resource immediately
+  **before** the command is sent (`HUE_PRE_COMMAND`).
 - `HueBridgeV2.create_request` – every individual HTTP attempt and status.
+  This is the primary layer; the aiohue logical request layer
+  (`HueBridgeV2.request`) is intentionally **not** logged because it
+  duplicates the HTTP layer line for line.
 - `EventStream.emit` – events pushed from the bridge.
 - `HueBaseEntity._handle_event` – resulting Hue resource and HA entity state.
+
+To keep the log volume low:
+
+- `geofence_client` traffic (requests and events) is ignored completely.
+- Read-only `GET` traffic and the HA command completion line are DEBUG-only;
+  run at `info` for the normal trace.
 
 Because the wrappers only log and then call the original code unchanged, they do
 not alter light control. If a future Home Assistant or aiohue update changes the
@@ -58,10 +68,12 @@ hue_debug:
 logger:
   default: warning
   logs:
-    # INFO shows all mutating commands, events and resulting light state.
+    # INFO shows all mutating commands (with pre-command state), every HTTP
+    # request/response, events and resulting light state.
     custom_components.hue_debug: info
-    # Use DEBUG instead to also capture read-only GET traffic (noisy, but
-    # useful for a full picture during a short reproduction window):
+    # Use DEBUG instead to also capture read-only GET traffic and HA command
+    # completion lines (noisy, but useful for a full picture during a short
+    # reproduction window):
     # custom_components.hue_debug: debug
 ```
 
@@ -80,8 +92,8 @@ Each log line is tagged so you can filter and correlate:
 
 | Tag                  | Meaning                                                          |
 | -------------------- | --------------------------------------------------------------- |
-| `HUE_HA_REQUEST`     | Home Assistant command, with mapped `entity` and `resource_id`. |
-| `HUE_API_REQUEST`    | aiohue logical request (with `ha_request` correlation id).      |
+| `HUE_HA_REQUEST`     | Home Assistant command, with mapped `entity` and `resource_id` (the `<-` completion line is DEBUG-only). |
+| `HUE_PRE_COMMAND`    | State the bridge last reported for the target resource **before** the command was sent (from aiohue's event-maintained cache), incl. group members for grouped lights. |
 | `HUE_HTTP_REQUEST`   | Individual HTTP attempt to the bridge (includes retries).       |
 | `HUE_HTTP_RESPONSE`  | HTTP status and time to headers.                                |
 | `HUE_HTTP_COMPLETE`  | HTTP attempt finished (status and total time).                  |
@@ -90,16 +102,27 @@ Each log line is tagged so you can filter and correlate:
 | `HUE_ENTITY_STATE`   | Resulting HA entity state **after** processing.                 |
 
 The `#<n>` request numbers and the `ha_request=<n>` field let you trace a single
-user action from the HA command, through the logical API call, down to each HTTP
-attempt.
+user action from the HA command down to each HTTP attempt. `geofence_client`
+requests and events never appear in the log.
+
+### Capturing the brightness a light reports while still off
+
+Immediately before each interesting HA command, a `HUE_PRE_COMMAND` line is
+logged with the state the bridge last reported for the target resource
+(`on`, `brightness_pct`, `mirek`, and for grouped lights each member light's
+`on`/`brightness_pct`). This uses aiohue's EventStream-maintained cache, so it
+shows exactly what the API reports — e.g. the brightness a light reports while
+it is still off — at the moment the turn-on command is issued, without making
+an extra request to the bridge.
 
 ### For the "turns on at 1%" bug
 
-Look at the `HUE_HA_REQUEST`/`HUE_API_REQUEST` for the turn-on and check the
-`brightness` sent, then the following `HUE_EVENT`/`HUE_ENTITY_STATE` to see what
-the bridge reports back. The relevant Home Assistant workaround values
-(`_last_brightness` for individual lights, `_restore_brightness` for groups) are
-included in the entity snapshots.
+Look at the `HUE_PRE_COMMAND` + `HUE_HA_REQUEST` pair for the turn-on: the
+first shows what the bridge reported before the command, the second shows the
+`brightness` actually sent. Then the following `HUE_EVENT`/`HUE_ENTITY_STATE`
+show what the bridge reports back. The relevant Home Assistant workaround
+values (`_last_brightness` for individual lights, `_restore_brightness` for
+groups) are included in the entity snapshots.
 
 ### For the "one light stays off" bug
 

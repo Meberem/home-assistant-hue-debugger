@@ -1,4 +1,15 @@
-"""Instrumentation for debugging the Home Assistant Philips Hue integration."""
+"""Instrumentation for debugging the Home Assistant Philips Hue integration.
+
+Logging is deliberately lean: every individual HTTP attempt to the bridge is
+logged (the most valuable layer), Home Assistant level commands are logged
+with their mapped entity, and geofence_client traffic is ignored entirely.
+The aiohue logical request layer is not logged because it duplicates the HTTP
+layer line for line.
+
+Before each interesting HA command, the state the bridge last reported for
+the target resource (from aiohue's EventStream-maintained cache) is logged,
+which captures e.g. the brightness a light reports while it is still off.
+"""
 
 from __future__ import annotations
 
@@ -30,7 +41,6 @@ _CURRENT_HA_REQUEST: ContextVar[int | None] = ContextVar(
 # in module globals. This prevents an integration reload from wrapping an
 # already-wrapped method.
 _ORIG_HA_REQUEST = "_hue_debug_original_async_request_call"
-_ORIG_AIOHUE_REQUEST = "_hue_debug_original_request"
 _ORIG_AIOHUE_CREATE_REQUEST = "_hue_debug_original_create_request"
 _ORIG_EVENT_EMIT = "_hue_debug_original_event_emit"
 _ORIG_ENTITY_HANDLE_EVENT = "_hue_debug_original_entity_handle_event"
@@ -48,6 +58,11 @@ _INTERESTING_COMMANDS = {
     "turn_off",
     "set_dimming_delta",
 }
+
+# Resource types that are never logged at any level. The bridge updates the
+# geofence_client resource once per minute; it is pure noise when
+# investigating light behaviour.
+_IGNORED_RESOURCE_TYPES = {"geofence_client"}
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +95,20 @@ def _callable_name(value: Callable[..., Any]) -> str:
         return name
     except Exception:
         return repr(value)
+
+
+def _resource_type_from_path(path: str) -> str | None:
+    """Extract the resource type from a CLIP v2 path, if present."""
+    parts = path.lstrip("/").split("/")
+
+    if (
+        len(parts) >= 4
+        and parts[0] == "clip"
+        and parts[2] == "resource"
+    ):
+        return parts[3]
+
+    return None
 
 
 def _resource_state(resource: Any) -> dict[str, Any]:
@@ -301,6 +330,95 @@ def _find_entity_id(
     return None
 
 
+def _controller_resource(
+    task: Callable[..., Any],
+    resource_id: str,
+) -> Any:
+    """
+    Return the bridge-cached resource for a controller command.
+
+    HA passes bound controller methods (e.g. GroupedLightController.set_state)
+    as the task; every aiohue BaseResourcesController keeps an EventStream-
+    maintained cache and exposes .get(id) on it. This is the state the bridge
+    last reported on the API, without making an extra request.
+    """
+    controller = getattr(task, "__self__", None)
+    getter = getattr(controller, "get", None)
+
+    if getter is None:
+        return None
+
+    try:
+        return getter(resource_id)
+    except Exception:
+        return None
+
+
+def _log_pre_command_state(
+    request_id: int,
+    entity_id: str | None,
+    task: Callable[..., Any],
+    resource_id: str,
+    task_name: str,
+) -> None:
+    """
+    Log the state the bridge last reported for the target resource *before*
+    the command is sent.
+
+    This captures exactly what the API reports for a light while it is still
+    off at the moment a turn-on command is issued (e.g. the brightness a
+    light reports after being turned on to minimum / turned off).
+    """
+    try:
+        resource = _controller_resource(task, resource_id)
+
+        if resource is None:
+            return
+
+        group_members: Any = "-"
+        controller = getattr(task, "__self__", None)
+        get_lights = getattr(controller, "get_lights", None)
+
+        if get_lights is not None:
+            try:
+                group_members = [
+                    {
+                        "id": light.id,
+                        "on": getattr(
+                            getattr(light, "on", None),
+                            "on",
+                            None,
+                        ),
+                        "brightness_pct": getattr(
+                            getattr(light, "dimming", None),
+                            "brightness",
+                            None,
+                        ),
+                    }
+                    for light in get_lights(resource_id)
+                ]
+            except Exception:
+                group_members = "<error>"
+
+        LOGGER.info(
+            "HUE_PRE_COMMAND #%d entity=%s task=%s resource_id=%s "
+            "reported_state=%s group_members=%s",
+            request_id,
+            entity_id or "<unknown>",
+            task_name,
+            resource_id,
+            _safe_repr(_resource_state(resource)),
+            _safe_repr(group_members),
+        )
+
+    except Exception:
+        LOGGER.exception(
+            "Hue debug instrumentation failed logging pre-command "
+            "state for request #%d",
+            request_id,
+        )
+
+
 def _log_event(
     bridge: HueBridgeV2,
     event_type: EventType,
@@ -310,6 +428,9 @@ def _log_event(
     """Log an EventStream event without affecting event processing."""
     try:
         resource_type = data.get("type") if data else None
+
+        if resource_type in _IGNORED_RESOURCE_TYPES:
+            return
 
         resource_id = (
             data.get("id") or data.get("rid")
@@ -400,6 +521,15 @@ async def _patched_ha_request_call(
             _safe_repr(kwargs),
         )
 
+        if important and resource_id is not None:
+            _log_pre_command_state(
+                request_id,
+                entity_id,
+                task,
+                resource_id,
+                task_name,
+            )
+
     except Exception:
         LOGGER.exception(
             "Hue debug instrumentation failed logging "
@@ -439,86 +569,13 @@ async def _patched_ha_request_call(
         time.perf_counter() - started
     ) * 1000
 
-    level(
+    # The completion line is DEBUG-only: its result/elapsed duplicate the
+    # HUE_HTTP_COMPLETE line, which is the layer worth reading.
+    LOGGER.debug(
         "HUE_HA_REQUEST #%d <- result=%s elapsed=%.1fms",
         request_id,
         _safe_repr(result),
         elapsed_ms,
-    )
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# aiohue logical request instrumentation
-# ---------------------------------------------------------------------------
-
-
-async def _patched_aiohue_request(
-    self: HueBridgeV2,
-    method: str,
-    path: str,
-    *args: Any,
-    **kwargs: Any,
-) -> Any:
-    """Instrument aiohue's logical V2 API request."""
-    request_id = next(_REQUEST_COUNTER)
-    ha_request_id = _CURRENT_HA_REQUEST.get()
-    started = time.perf_counter()
-
-    method_upper = method.upper()
-
-    # GETs are normally startup/state reads and are noisy.
-    # Mutating calls are kept at INFO.
-    level = (
-        LOGGER.debug
-        if method_upper == "GET"
-        else LOGGER.info
-    )
-
-    level(
-        "HUE_API_REQUEST #%d ha_request=%s -> %s %s json=%s",
-        request_id,
-        ha_request_id if ha_request_id is not None else "-",
-        method_upper,
-        path,
-        _safe_repr(kwargs.get("json")),
-    )
-
-    try:
-        original = getattr(
-            type(self),
-            _ORIG_AIOHUE_REQUEST,
-        )
-
-        result = await original(
-            self,
-            method,
-            path,
-            *args,
-            **kwargs,
-        )
-
-    except Exception as err:
-        LOGGER.error(
-            "HUE_API_REQUEST #%d ha_request=%s <- ERROR "
-            "after %.1fms type=%s error=%s",
-            request_id,
-            ha_request_id if ha_request_id is not None else "-",
-            (time.perf_counter() - started) * 1000,
-            type(err).__name__,
-            err,
-            exc_info=True,
-        )
-        raise
-
-    level(
-        "HUE_API_REQUEST #%d ha_request=%s <- result=%s "
-        "elapsed=%.1fms",
-        request_id,
-        ha_request_id if ha_request_id is not None else "-",
-        _safe_repr(result),
-        (time.perf_counter() - started) * 1000,
     )
 
     return result
@@ -545,6 +602,11 @@ async def _patched_aiohue_create_request(
     method_upper = method.upper()
     is_eventstream = path == "eventstream/clip/v2"
 
+    # Ignored resource types (e.g. geofence_client) are not logged at all.
+    ignored = (
+        _resource_type_from_path(path) in _IGNORED_RESOURCE_TYPES
+    )
+
     suffix = (
         " [EVENTSTREAM]"
         if is_eventstream
@@ -559,15 +621,16 @@ async def _patched_aiohue_create_request(
         else LOGGER.debug
     )
 
-    level(
-        "HUE_HTTP_REQUEST #%d ha_request=%s -> %s %s%s json=%s",
-        request_id,
-        ha_request_id if ha_request_id is not None else "-",
-        method_upper,
-        path,
-        suffix,
-        _safe_repr(kwargs.get("json")),
-    )
+    if not ignored:
+        level(
+            "HUE_HTTP_REQUEST #%d ha_request=%s -> %s %s%s json=%s",
+            request_id,
+            ha_request_id if ha_request_id is not None else "-",
+            method_upper,
+            path,
+            suffix,
+            _safe_repr(kwargs.get("json")),
+        )
 
     response = None
     status: int | None = None
@@ -592,42 +655,45 @@ async def _patched_aiohue_create_request(
         ) as response:
             status = response.status
 
+            if not ignored:
+                level(
+                    "HUE_HTTP_RESPONSE #%d ha_request=%s "
+                    "<- status=%s elapsed_to_headers=%.1fms%s",
+                    request_id,
+                    ha_request_id if ha_request_id is not None else "-",
+                    status,
+                    (time.perf_counter() - started) * 1000,
+                    suffix,
+                )
+
+            yield response
+
+    except Exception as err:
+        if not ignored:
+            LOGGER.error(
+                "HUE_HTTP_REQUEST #%d ha_request=%s <- ERROR "
+                "after %.1fms type=%s error=%s%s",
+                request_id,
+                ha_request_id if ha_request_id is not None else "-",
+                (time.perf_counter() - started) * 1000,
+                type(err).__name__,
+                err,
+                suffix,
+                exc_info=True,
+            )
+        raise
+
+    finally:
+        if not ignored:
             level(
-                "HUE_HTTP_RESPONSE #%d ha_request=%s "
-                "<- status=%s elapsed_to_headers=%.1fms%s",
+                "HUE_HTTP_COMPLETE #%d ha_request=%s <- "
+                "status=%s total=%.1fms%s",
                 request_id,
                 ha_request_id if ha_request_id is not None else "-",
                 status,
                 (time.perf_counter() - started) * 1000,
                 suffix,
             )
-
-            yield response
-
-    except Exception as err:
-        LOGGER.error(
-            "HUE_HTTP_REQUEST #%d ha_request=%s <- ERROR "
-            "after %.1fms type=%s error=%s%s",
-            request_id,
-            ha_request_id if ha_request_id is not None else "-",
-            (time.perf_counter() - started) * 1000,
-            type(err).__name__,
-            err,
-            suffix,
-            exc_info=True,
-        )
-        raise
-
-    finally:
-        level(
-            "HUE_HTTP_COMPLETE #%d ha_request=%s <- "
-            "status=%s total=%.1fms%s",
-            request_id,
-            ha_request_id if ha_request_id is not None else "-",
-            status,
-            (time.perf_counter() - started) * 1000,
-            suffix,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -864,13 +930,6 @@ def _patch_classes() -> None:
 
     _patch_method(
         HueBridgeV2,
-        "request",
-        _ORIG_AIOHUE_REQUEST,
-        _patched_aiohue_request,
-    )
-
-    _patch_method(
-        HueBridgeV2,
         "create_request",
         _ORIG_AIOHUE_CREATE_REQUEST,
         _patched_aiohue_create_request,
@@ -897,10 +956,12 @@ def _patch_classes() -> None:
     )
 
     LOGGER.warning(
-        "Hue debug instrumentation enabled: HA Hue calls, "
-        "logical API calls, individual HTTP attempts/statuses, "
-        "EventStream events, and resulting Hue light entity "
-        "state will be logged."
+        "Hue debug instrumentation enabled: HA Hue commands (with "
+        "pre-command bridge-reported state), individual HTTP "
+        "attempts/statuses, EventStream events, and resulting Hue "
+        "light entity state will be logged. geofence_client traffic "
+        "is ignored and the aiohue logical request layer is not "
+        "logged (it duplicates the HTTP layer)."
     )
 
 

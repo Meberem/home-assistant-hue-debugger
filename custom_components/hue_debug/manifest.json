@@ -1,7 +1,7 @@
 {
   "domain": "hue_debug",
   "name": "Hue Debug Instrumentation",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "codeowners": [],
   "dependencies": [],
   "after_dependencies": ["hue"],
